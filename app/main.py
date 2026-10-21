@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, Request
 from starlette.middleware.base import RequestResponseEndpoint
-from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from app.api.api import api_router
@@ -64,8 +63,6 @@ RATE_LIMIT_EXEMPT_PATHS = {
     *filter(None, (app.docs_url, app.swagger_ui_oauth2_redirect_url, app.redoc_url, app.openapi_url)),
 }
 app.include_router(api_router)
-# gzip responses (clients sending Accept-Encoding: gzip): raw payloads compress ~25x, cutting egress for bulk crawling
-app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 
 async def sdk_error_response(request: Request, error: Exception) -> JSONResponse:
