@@ -45,7 +45,12 @@ class TfmktClient:
             headers={"Accept": "application/json", "User-Agent": "transfermarkt-api"},
             timeout=timeout,
             transport=transport,
+            limits=httpx.Limits(
+                max_connections=max_concurrency,
+                max_keepalive_connections=max_concurrency,
+            ),
         )
+        self._inflight: dict[str, list] = {}  # key -> [task, waiter count]
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.cache: TTLCache | None = TTLCache(maxsize=cache.max_entries, ttl=cache.ttl) if cache else None
         self.reference_cache: TTLCache | None = TTLCache(maxsize=8, ttl=cache.reference_ttl) if cache else None
@@ -74,17 +79,7 @@ class TfmktClient:
             record_fetch(fetched_at)
             return data
 
-        async with self.semaphore:
-            try:
-                response = await self.http.send(request)
-            except httpx.TimeoutException as e:
-                if self._transport_injected:
-                    raise
-                raise UpstreamTimeout(f"Upstream timeout for {path}", url=str(request.url)) from e
-            except httpx.HTTPError as e:
-                if self._transport_injected:
-                    raise
-                raise UpstreamError(f"Upstream connection error for {path}: {e}", url=str(request.url)) from e
+        response = await self._single_flight(key, request, path)
 
         data = self._parse(response, path)
         fetched_at = response.extensions.get("transfermarkt_fetched_at", datetime.now(UTC).replace(tzinfo=None))
@@ -96,6 +91,45 @@ class TfmktClient:
             cache[key] = (fetched_at, data)
         record_fetch(fetched_at)
         return data
+
+    async def _single_flight(self, key: str, request: httpx.Request, path: str) -> httpx.Response:
+        """
+        Share one upstream call between concurrent identical requests.
+
+        The call is cancelled and drained when its last waiting caller is cancelled, as a lone request would be.
+        """
+        entry = self._inflight.get(key)
+        if entry is None:
+            task = asyncio.ensure_future(self._fetch(request, path))
+            entry = self._inflight[key] = [task, 0]
+            task.add_done_callback(lambda t: self._inflight.get(key, [None])[0] is t and self._inflight.pop(key))
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())  # mark the error as retrieved
+        task = entry[0]
+        entry[1] += 1
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            entry[1] -= 1
+            if entry[1] == 0 and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+        else:
+            entry[1] -= 1
+
+    async def _fetch(self, request: httpx.Request, path: str) -> httpx.Response:
+        """Send one upstream request under the concurrency cap, mapping transport failures."""
+        async with self.semaphore:
+            try:
+                return await self.http.send(request)
+            except httpx.TimeoutException as e:
+                if self._transport_injected:
+                    raise
+                raise UpstreamTimeout(f"Upstream timeout for {path}", url=str(request.url)) from e
+            except httpx.HTTPError as e:
+                if self._transport_injected:
+                    raise
+                raise UpstreamError(f"Upstream connection error for {path}: {e}", url=str(request.url)) from e
 
     async def get_optional(self, path: str, params: Optional[list[tuple[str, Any]]] = None) -> Any:
         """Like `get`, but returns None when upstream answers 404 (e.g. a club without a stadium)."""
